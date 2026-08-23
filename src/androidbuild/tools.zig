@@ -54,11 +54,11 @@ java_tools: struct {
 },
 
 /// Reserved for future use
-const Options = struct {};
+const Options = struct {
+    cmdlineVersion: []const u8 = "latest",
+};
 
 pub fn create(b: *std.Build, options: Options) *Sdk {
-    _ = options;
-
     const host_os_tag = b.graph.host.result.os.tag;
 
     // Discover tool paths
@@ -100,7 +100,7 @@ pub fn create(b: *std.Build, options: Options) *Sdk {
     // - 1st: $ANDROID_HOME/cmdline-tools/bin
     // - 2nd: $ANDROID_HOME/tools/bin
     const cmdline_tool_path_list = [_][]const u8{
-        b.pathResolve(&[_][]const u8{ android_sdk_path, "cmdline-tools", "latest", "bin" }),
+        b.pathResolve(&[_][]const u8{ android_sdk_path, "cmdline-tools", options.cmdlineVersion, "bin" }),
         b.pathResolve(&[_][]const u8{ android_sdk_path, "tools", "bin" }),
     };
     const cmdline_tools_path: []const u8 = cmdlineblk: {
