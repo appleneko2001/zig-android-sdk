@@ -4,6 +4,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const androidbuild = @import("androidbuild.zig");
+const ResolvedTarget = std.Build.ResolvedTarget;
+const Arch = std.Target.Cpu.Arch;
 
 const Allocator = std.mem.Allocator;
 const ApiLevel = androidbuild.ApiLevel;
@@ -14,6 +16,10 @@ android_sdk_path: []const u8,
 version: []const u8,
 /// ie. "$ANDROID_HOME/ndk/{ndk_version}"
 path: []const u8,
+
+// FIXME: refactoring...? since we've seen the repeat pattern here it would be easy to get subfolders by implementing a helper function
+/// ie. "$ANDROID_HOME/ndk/{ndk_version}/toolchains/llvm/prebuilt/{host_os_and_arch}"
+llvm_path: []const u8,
 /// ie. "$ANDROID_HOME/ndk/{ndk_version}/toolchains/llvm/prebuilt/{host_os_and_arch}/sysroot"
 sysroot_path: []const u8,
 /// ie. "$ANDROID_HOME/ndk/{ndk_version}/toolchains/llvm/prebuilt/{host_os_and_arch}/sysroot/usr/include"
@@ -23,11 +29,24 @@ pub const empty: Ndk = .{
     .android_sdk_path = &[0]u8{},
     .version = &[0]u8{},
     .path = &[0]u8{},
+    .llvm_path = &[0]u8{},
     .sysroot_path = &[0]u8{},
     .include_path = &[0]u8{},
 };
 
 const NdkError = Allocator.Error || error{NdkFailed};
+
+pub fn getClangArch(targetArch: Arch) error{InvalidAndroidTarget}![]const u8 {
+    // if (!target.result.abi.isAndroid()) return error.InvalidAndroidTarget;
+    return switch (targetArch) {
+        .x86 => "i386",
+        .x86_64 => "x86_64",
+        .arm => "arm",
+        .aarch64 => "aarch64",
+        .riscv64 => "riscv64",
+        else => error.InvalidAndroidTarget,
+    };
+}
 
 pub fn init(b: *std.Build, android_sdk_path: []const u8, ndk_version: []const u8, errors: *std.ArrayListUnmanaged([]const u8)) NdkError!Ndk {
     // Get NDK path
@@ -110,14 +129,109 @@ pub fn init(b: *std.Build, android_sdk_path: []const u8, ndk_version: []const u8
         return error.NdkFailed;
     }
 
+    // Get NDK LLVM Root path
+    // ie. $ANDROID_HOME/ndk/{ndk_version}/toolchains/llvm/prebuilt/{host_os_and_arch}
+    const ndk_llvm = b.fmt("{s}/ndk/{s}/toolchains/llvm/prebuilt/{s}", .{
+        android_sdk_path,
+        ndk_version,
+        host_os_and_arch,
+    });
+
     const ndk: Ndk = .{
         .android_sdk_path = android_sdk_path,
         .path = android_ndk_path,
+        .llvm_path = ndk_llvm,
         .version = ndk_version,
         .sysroot_path = ndk_sysroot,
         .include_path = b.fmt("{s}/usr/include", .{ndk_sysroot}),
     };
     return ndk;
+}
+
+// TODO: pick the suitable lldb-server for device but not based on compiled binaries
+pub fn findNdkDebugServer(ndk: *const Ndk, b: *std.Build, targetArch: Arch, errors: *std.ArrayListUnmanaged([]const u8)) ![]const u8 {
+    const llvm_root_path = ndk.llvm_path;
+
+    const base_clang_lib_dir = blk: {
+        const access_wrapped_error = if (builtin.zig_version.major == 0 and builtin.zig_version.minor <= 15)
+            std.fs.openDirAbsolute(llvm_root_path, .{})
+        else
+            std.Io.Dir.openDirAbsolute(b.graph.io, llvm_root_path, .{});
+
+        if (access_wrapped_error) |root_dir| {
+            const clang_base_dir_wrapped_error = if (builtin.zig_version.major == 0 and builtin.zig_version.minor <= 15)
+                root_dir.openDir("lib/clang", .{})
+            else
+                root_dir.openDir(b.graph.io, "lib/clang", .{});
+
+            if (clang_base_dir_wrapped_error) |clang_lib| {
+                break :blk clang_lib;
+            } else |err| {
+                const message = b.fmt("Couldn't access the LLVM Clang folder '{s}/{s}': '{s}'", .{
+                    llvm_root_path,
+                    "lib/clang",
+                    @errorName(err),
+                });
+                errors.append(b.allocator, message) catch @panic("OOM");
+                return err;
+            }
+        } else |err| {
+            const message = b.fmt("Couldn't access the LLVM Root folder '{s}': '{s}'", .{
+                llvm_root_path,
+                @errorName(err),
+            });
+            errors.append(b.allocator, message) catch @panic("OOM");
+            return err;
+        }
+    };
+
+    // TODO: 0.15
+    var iterator = base_clang_lib_dir.iterate();
+    while (iterator.next(b.graph.io) catch |err| {
+        const message = b.fmt("Couldn't walk through the folder '{s}/{s}': '{s}'", .{
+            llvm_root_path,
+            "lib/clang",
+            @errorName(err),
+        });
+        errors.append(b.allocator, message) catch @panic("OOM");
+        return err;
+    }) |clang_root_entry| {
+        const clang_root_subname = clang_root_entry.name;
+
+        const clang_lib_dir = blk: {
+            const access_wrapped_error = if (builtin.zig_version.major == 0 and builtin.zig_version.minor <= 15)
+                base_clang_lib_dir.openDir(clang_root_subname, .{})
+            else
+                base_clang_lib_dir.openDir(b.graph.io, clang_root_subname, .{});
+            // TODO: 0.15
+            if (access_wrapped_error) |root_lib_dir| {
+                // Expecting smth like /toolchains/llvm/prebuilt/linux-x86_64/lib/clang/<clang_root_subname>/
+                // and now get the subfolders
+                const path = std.Io.Dir.realPathFileAlloc(root_lib_dir, b.graph.io, "lib/linux", b.allocator) catch @panic("OOM");
+                break :blk std.Io.Dir.openDirAbsolute(b.graph.io, path, .{}) catch |err| {
+                    const message = b.fmt("Couldn't access the folder '{s}': '{s}'", .{
+                        path,
+                        @errorName(err),
+                    });
+                    errors.append(b.allocator, message) catch @panic("OOM");
+                    return err;
+                };
+            } else |err| {
+                const path = base_clang_lib_dir.realPathFileAlloc(b.graph.io, clang_root_subname, b.allocator) catch @panic("OOM");
+                const message = b.fmt("Couldn't access the Clang Root folder '{s}': '{s}'", .{
+                    path,
+                    @errorName(err),
+                });
+                errors.append(b.allocator, message) catch @panic("OOM");
+                return err;
+            }
+        };
+
+        const final_dir = try clang_lib_dir.openDir(b.graph.io, try getClangArch(targetArch), .{});
+        return final_dir.realPathFileAlloc(b.graph.io, "lldb-server", b.allocator) catch @panic("OOM");
+    }
+
+    return error.NotFound;
 }
 
 pub fn validateApiLevel(ndk: *const Ndk, b: *std.Build, api_level: ApiLevel, errors: *std.ArrayListUnmanaged([]const u8)) void {
